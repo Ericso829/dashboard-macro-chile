@@ -1,11 +1,15 @@
 import re
+import pandas as pd
 import streamlit as st
 import yfinance as yf
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from difflib import SequenceMatcher
+
+_TZ_CL = ZoneInfo("America/Santiago")
 
 st.set_page_config(page_title="MIS Macroeconómico Chile", layout="wide")
 
@@ -130,29 +134,56 @@ def fetch_desempleo():
 
 def _parse_te_calendar(lines):
     """
-    Extract most recent Actual/Previous from a TE calendar table.
-    Table structure:
-      [i]   "Actual"
-      [i+1] "Previous"
-      [i+2] "Consensus"
-      [i+3] "TEForecast"
-      [i+4] date
-      [i+5] time
-      [i+6] indicator name
-      [i+7] period (e.g. "Feb")
-      [i+8] actual value
-      [i+9] previous value
+    Extract the most recently PUBLISHED actual value from a TradingEconomics
+    calendar table. The calendar contains multiple rows chronologically.
+    Each row: YYYY-MM-DD / HH:MM / indicator / period / actual / previous / ...
+    We scan forward from the 'Actual' header, collect all date-rows that have a
+    non-empty actual value, and return the last one (most recent published).
     """
+    DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    today   = datetime.now(_TZ_CL).date()
+
+    header_idx = None
     for i, l in enumerate(lines):
-        if l == "Actual" and i + 9 < len(lines) and lines[i+1] == "Previous":
-            try:
-                return {
-                    "actual":   lines[i+8],
-                    "previous": lines[i+9],
-                    "ref":      f"{lines[i+7]} {lines[i+4][:4]}",  # e.g. "Feb 2026"
-                }
-            except: pass
-    return {}
+        if l == "Actual" and i + 1 < len(lines) and lines[i+1] == "Previous":
+            header_idx = i
+            break
+    if header_idx is None:
+        return {}
+
+    # Find end of calendar region
+    end_idx = len(lines)
+    for i in range(header_idx + 4, len(lines)):
+        if lines[i] == "Related":
+            end_idx = i
+            break
+
+    # Scan calendar rows (each row starts with a YYYY-MM-DD date)
+    best = {}
+    i = header_idx + 4
+    while i < end_idx - 4:
+        if DATE_RE.match(lines[i]):
+            row_date = lines[i]
+            period   = lines[i+3] if i+3 < end_idx else "—"
+            actual   = lines[i+4] if i+4 < end_idx else None
+            prev     = lines[i+5] if i+5 < end_idx else None
+            # Accept only rows with a real numeric/currency actual (not a future forecast)
+            if actual and re.search(r"[\d]", actual):
+                try:
+                    pub = datetime.strptime(row_date, "%Y-%m-%d").date()
+                    if pub <= today:
+                        best = {
+                            "actual":   actual,
+                            "previous": prev,
+                            "ref":      f"{period} {row_date[:4]}",
+                        }
+                except: pass
+            # Advance: skip past this date's values to the next row
+            i += 5
+        else:
+            i += 1
+
+    return best
 
 def _parse_te_related(lines, indicator_name):
     """Find Last/Previous/Unit/Reference for a named indicator in the Related table."""
@@ -168,55 +199,226 @@ def _parse_te_related(lines, indicator_name):
             except: pass
     return {}
 
-@st.cache_data(ttl=3600)
-def fetch_pib_bloque():
+def _parse_num(raw):
+    """Parse a value string like '$2790M', '-1.6%', '335.52', '$-4.60B' → float."""
+    if not raw: return None
+    raw = str(raw).strip()
+    mult = 1
+    if raw.upper().endswith("B"): mult = 1_000
+    if raw.upper().endswith("T"): mult = 1_000_000
+    raw = raw.replace("$", "").replace(",", "").rstrip("MBKTmbtk%")
+    try:
+        return float(raw) * mult
+    except:
+        return None
+
+def _parse_te_related_table(html):
     """
-    PIB y derivados del Sector Real — Banco Central de Chile.
-    Datos via TradingEconomics (cita BCCh como fuente).
+    Parse the HTML Related table from a TradingEconomics page.
+    Returns dict: {indicator_name: {last, prev, unit, ref}}
     """
     out = {}
-    configs = [
-        ("PIB QoQ",          "/chile/gdp-growth",           "GDP Growth Rate QoQ"),
-        ("PIB Anual",        "/chile/gdp-growth-annual",    "GDP Growth Rate YoY"),
-        ("Exportaciones",    "/chile/exports",              "Exports"),
-        ("Importaciones",    "/chile/imports",              "Imports"),
-        ("Balanza Comercial","/chile/balance-of-trade",     "Balance of Trade"),
-        ("Producción Ind.",  "/chile/industrial-production","Industrial Production YoY"),
-        ("Ventas Retail",    "/chile/retail-sales-annual",  "Retail Sales YoY"),
-        ("Inversión (FBCF)", "/chile/gross-fixed-capital-formation","Gross Fixed Capital"),
-    ]
-    for label, path, te_name in configs:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for t in soup.find_all("table"):
+            headers = [th.get_text(strip=True) for th in t.find_all("th")]
+            if "Last" in headers and "Previous" in headers:
+                for row in t.find_all("tr"):
+                    cells = [c.get_text(strip=True) for c in row.find_all("td")]
+                    if len(cells) >= 4 and cells[0] and cells[0] not in ("Related","Last","Previous"):
+                        last = _parse_num(cells[1])
+                        prev = _parse_num(cells[2])
+                        if last is not None:
+                            out[cells[0]] = {
+                                "last": last, "prev": prev,
+                                "unit": cells[3] if len(cells) > 3 else "",
+                                "ref":  cells[4] if len(cells) > 4 else "",
+                            }
+    except Exception:
+        pass
+    return out
+
+def _fetch_calendar_indicator(path, label, unit):
+    """Fetch the most recent calendar actual for one TE path."""
+    try:
+        lines = _te(path)
+        cal = _parse_te_calendar(lines)
+        if cal and cal.get("actual"):
+            va = _parse_num(cal["actual"])
+            vp = _parse_num(cal.get("previous"))
+            if va is not None:
+                return {"val": va, "prev": vp, "ref": cal.get("ref","—"), "unit": unit}
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=3600)
+def fetch_pib_completo():
+    """
+    PIB completo — Banco Central de Chile.
+    Fuentes: TradingEconomics (cita BCCh), World Bank (series anuales).
+    Organizado en 5 grupos: tasas, valores, componentes, sectores, externo.
+    """
+    out = {
+        "tasas":      {},   # growth rates
+        "valores":    {},   # absolute values
+        "componentes":{},   # demand-side components
+        "sectores":   {},   # supply-side GDP by sector
+        "externo":    {},   # external + fiscal
+    }
+
+    # ── 1. GDP growth page — calendar + full Related table ────────
+    try:
+        html_gdp = _get("https://tradingeconomics.com/chile/gdp-growth")
+        lines_gdp = _lines(html_gdp)
+        related   = _parse_te_related_table(html_gdp)
+
+        # Calendar: PIB QoQ (most recent quarter)
+        cal = _parse_te_calendar(lines_gdp)
+        if cal and cal.get("actual"):
+            out["tasas"]["PIB QoQ"] = {
+                "val":  _parse_num(cal["actual"]),
+                "prev": _parse_num(cal.get("previous")),
+                "ref":  cal.get("ref","—"), "unit": "%",
+            }
+
+        # Related table values
+        RELATED_MAP = {
+            # key in TE Related → (our label, group, unit)
+            "Full Year GDP Growth":    ("PIB Año Completo 2025",  "tasas",      "%"),
+            "GDP Growth Rate YoY":     ("PIB Anual",              "tasas",      "%"),
+            "GDP":                     ("PIB Nominal",            "valores",    "B USD"),
+            "GDP Constant Prices":     ("PIB Constante (CLP B)",  "valores",    "B CLP"),
+            "GDP per Capita":          ("PIB per cápita",         "valores",    "USD"),
+            "GDP per Capita PPP":      ("PIB per cápita PPP",     "valores",    "USD"),
+            "Gross National Product":  ("Producto Nacional Bruto","valores",    "B CLP"),
+            "Gross Fixed Capital Formation": ("Inversión (FBCF)", "componentes","B CLP"),
+            "GDP from Agriculture":    ("Agropecuario",           "sectores",   "B CLP"),
+            "GDP from Construction":   ("Construcción",           "sectores",   "B CLP"),
+            "GDP from Manufacturing":  ("Industria Manufactura",  "sectores",   "B CLP"),
+            "GDP from Mining":         ("Minería",                "sectores",   "B CLP"),
+            "GDP from Public Administration": ("Administración Pública","sectores","B CLP"),
+            "GDP from Services":       ("Servicios",              "sectores",   "B CLP"),
+            "GDP from Transport":      ("Transporte",             "sectores",   "B CLP"),
+            "GDP from Utilities":      ("Utilities / Energía",    "sectores",   "B CLP"),
+        }
+        for te_key, (our_label, group, unit) in RELATED_MAP.items():
+            r = related.get(te_key)
+            if r:
+                out[group][our_label] = {
+                    "val":  r["last"], "prev": r["prev"],
+                    "ref":  r.get("ref","—"), "unit": unit,
+                }
+    except Exception:
+        pass
+
+    # ── 2. Additional growth rates ────────────────────────────────
+    for label, path, unit in [
+        ("Producción Ind. YoY", "/chile/industrial-production", "%"),
+        ("Ventas Retail YoY",   "/chile/retail-sales-annual",   "%"),
+    ]:
+        d = _fetch_calendar_indicator(path, label, unit)
+        if d: out["tasas"][label] = d
+
+    # ── 3. Trade data (calendar-based, most recent month) ─────────
+    for label, path, unit in [
+        ("Exportaciones",     "/chile/exports",         "M USD"),
+        ("Importaciones",     "/chile/imports",         "M USD"),
+        ("Balanza Comercial", "/chile/balance-of-trade","M USD"),
+    ]:
+        d = _fetch_calendar_indicator(path, label, unit)
+        if d: out["componentes"][label] = d
+
+    # Consumo + Gasto Gobierno from related tables
+    for label, path, unit in [
+        ("Consumo Privado", "/chile/consumer-spending", "B CLP"),
+        ("Gasto Gobierno",  "/chile/government-spending","B CLP"),
+    ]:
         try:
-            lines = _te(path)
-            full  = " ".join(lines)
-            is_pct = any(x in te_name for x in ["Growth","Production","Sales"])
-            # Try calendar first
-            cal = _parse_te_calendar(lines)
-            if cal and cal.get("actual"):
-                raw_a = cal["actual"].replace("$","").replace(",","")
-                raw_p = cal.get("previous","").replace("$","").replace(",","")
-                mult_a = 1000 if raw_a.upper().endswith("B") else 1
-                mult_p = 1000 if raw_p.upper().endswith("B") else 1
-                raw_a = raw_a.rstrip("MBK%")
-                raw_p = raw_p.rstrip("MBK%")
-                try:
-                    val_f  = float(raw_a) * mult_a
-                    prev_f = float(raw_p) * mult_p
-                    out[label] = {
-                        "val":  val_f,
-                        "prev": prev_f,
-                        "ref":  cal.get("ref","—"),
-                        "unit": "%" if is_pct else "M USD",
+            html = _get(f"https://tradingeconomics.com{path}")
+            rel  = _parse_te_related_table(html)
+            for te_key, row in rel.items():
+                if "Consumer Spending" in te_key or "Government Spending" in te_key or "Spending" in te_key:
+                    out["componentes"][label] = {
+                        "val": row["last"], "prev": row["prev"],
+                        "ref": row.get("ref","—"), "unit": unit,
                     }
-                    continue
-                except: pass
-            # Fallback: summary sentence
-            nums = re.findall(r"(-?\d+\.?\d*)\s*percent", full, re.I)
-            if nums:
-                out[label] = {"val": float(nums[0]), "prev": float(nums[1]) if len(nums)>1 else None,
-                              "ref": "reciente", "unit": "%"}
+                    break
         except Exception:
             pass
+
+    # ── 4. Sector externo y fiscal ────────────────────────────────
+    for label, path, unit in [
+        ("Cuenta Corriente",     "/chile/current-account",          "B USD"),
+        ("Cta. Cte. % PIB",      "/chile/current-account-to-gdp",   "%"),
+        ("Deuda Externa",        "/chile/external-debt",            "M USD"),
+        ("Reservas Int.",        "/chile/foreign-exchange-reserves", "M USD"),
+        ("Deuda Gob. % PIB",     "/chile/government-debt-to-gdp",   "%"),
+        ("Balance Fiscal % PIB", "/chile/government-budget",        "%"),
+        ("IED",                  "/chile/foreign-direct-investment", "M USD"),
+    ]:
+        d = _fetch_calendar_indicator(path, label, unit)
+        if d:
+            out["externo"][label] = d
+        else:
+            # fallback via Related table
+            try:
+                html = _get(f"https://tradingeconomics.com{path}")
+                rel  = _parse_te_related_table(html)
+                for _, row in rel.items():
+                    if row["last"] is not None:
+                        out["externo"][label] = {
+                            "val":  row["last"], "prev": row["prev"],
+                            "ref":  row.get("ref","—"), "unit": unit,
+                        }
+                        break
+            except Exception:
+                pass
+
+    return out
+
+# ─────────────────────────────────────────────────────────────────
+# World Bank historical series (annual, up to 12 years)
+# ─────────────────────────────────────────────────────────────────
+_WB = "https://api.worldbank.org/v2/country/CL/indicator"
+
+def _wb_series(code, n=12):
+    """Fetch a World Bank indicator series for Chile, returns sorted {year:value} dict."""
+    try:
+        r = requests.get(f"{_WB}/{code}?format=json&per_page={n}&mrv={n}",
+                         headers=_H, timeout=30)
+        data = r.json()[1] if r.status_code == 200 and len(r.json()) > 1 else []
+        pts  = {d["date"]: round(d["value"], 3)
+                for d in (data or []) if d["value"] is not None}
+        return dict(sorted(pts.items()))  # oldest → newest
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=86400)   # 24h — annual data rarely changes
+def fetch_wb_historial():
+    """
+    World Bank annual historical series for Chile.
+    Returns dict of {indicator_label: {year: value, ...}}.
+    Cached 24h.
+    """
+    codes = {
+        "Crecimiento PIB (%)":      "NY.GDP.MKTP.KD.ZG",
+        "PIB Nominal (B USD)":      "NY.GDP.MKTP.CD",
+        "PIB per cápita (USD)":     "NY.GDP.PCAP.CD",
+        "PIB per cápita PPP (USD)": "NY.GDP.PCAP.PP.CD",
+        "Consumo Hogares (% PIB)":  "NE.CON.PETC.ZS",
+        "FBCF (% PIB)":             "NE.GDI.TOTL.ZS",
+        "Exportaciones (% PIB)":    "NE.EXP.GNFS.ZS",
+        "Importaciones (% PIB)":    "NE.IMP.GNFS.ZS",
+    }
+    out = {}
+    for label, code in codes.items():
+        s = _wb_series(code, n=15)
+        if s:
+            # Convert PIB Nominal to billions
+            if "B USD" in label:
+                s = {k: round(v/1e9, 2) for k, v in s.items()}
+            out[label] = s
     return out
 
 # ═══════════════════════════════════════════════════════════════
@@ -428,19 +630,20 @@ def _commodity_block(col, nombre, data):
 
 st.title("📊 Dashboard Macroeconómico Chile")
 st.caption(
-    f"Actualizado: {datetime.now().strftime('%d/%m/%Y %H:%M')}  ·  "
+    f"Actualizado: {datetime.now(_TZ_CL).strftime('%d/%m/%Y %H:%M')} (hora Chile)  ·  "
     "Mercados al cierre del viernes 10/04/2026  ·  "
     "Publicaciones mensuales según última disponibilidad oficial"
 )
 st.divider()
 
 with st.spinner("Cargando datos…"):
-    minind = fetch_mindicador()
-    hist   = fetch_historial()
-    ipc    = fetch_ipc()
-    desem  = fetch_desempleo()
-    pib    = fetch_pib_bloque()
-    mkt    = fetch_mercados()
+    minind  = fetch_mindicador()
+    hist    = fetch_historial()
+    ipc     = fetch_ipc()
+    desem   = fetch_desempleo()
+    pib     = fetch_pib_completo()
+    mkt     = fetch_mercados()
+    wb_hist = fetch_wb_historial()
 
 usd_clp_rate = next((v["usd_clp"] for v in mkt.values() if v.get("usd_clp")), None)
 
@@ -488,7 +691,6 @@ else:
 # SECCIÓN 2 – VALORES HISTÓRICOS (mini tabla)
 # ──────────────────────────────────────────────────────────────
 with st.expander("🕐 Valores Históricos — últimos 5 períodos", expanded=False):
-    import pandas as pd
     tabs = st.tabs(["IPC","USD/CLP","TPM","UF"])
     labels = ["IPC","USD/CLP","TPM","UF"]
     for tab, label in zip(tabs, labels):
@@ -506,53 +708,219 @@ with st.expander("🕐 Valores Históricos — últimos 5 períodos", expanded=F
 st.divider()
 
 # ──────────────────────────────────────────────────────────────
-# SECCIÓN 3 – PIB Y SECTOR REAL (BCCh)
+# SECCIÓN 3 – PIB COMPLETO (BCCh)
 # ──────────────────────────────────────────────────────────────
-st.subheader("🏛️ PIB y Sector Real — Banco Central de Chile")
-st.caption("Datos publicados por el BCCh, consolidados vía TradingEconomics")
+st.subheader("🏛️ PIB y Cuentas Nacionales — Banco Central de Chile")
+st.caption(
+    "Datos publicados por el BCCh consolidados vía TradingEconomics · "
+    "[Ver en BCCh →](https://www.bcentral.cl/web/banco-central/areas/estadisticas/sector-real)"
+)
 
-pib_order = [
-    ("PIB QoQ",          "%"),
-    ("PIB Anual",        "%"),
-    ("Exportaciones",    "M USD"),
-    ("Importaciones",    "M USD"),
-    ("Balanza Comercial","M USD"),
-    ("Producción Ind.",  "%"),
-    ("Ventas Retail",    "%"),
-    ("Inversión (FBCF)", "%"),
-]
+def _fmt_val(d):
+    v, u = d.get("val"), d.get("unit","")
+    if v is None: return "—"
+    if u == "%":     return f"{v:.1f}%"
+    if u == "B USD": return f"USD {v:,.2f}B"
+    if u == "B CLP": return f"CLP {v:,.1f}B"
+    if u == "M USD": return f"USD {v:,.0f}M"
+    if u == "USD":   return f"USD {v:,.0f}"
+    return f"{v:,.2f}"
 
-rows = [k for k, _ in pib_order if k in pib]
-if rows:
-    cols_pib = st.columns(min(4, len(rows)))
-    for i, key in enumerate(rows):
-        d    = pib[key]
-        col  = cols_pib[i % 4]
-        val  = d.get("val")
-        prev = d.get("prev")
-        unit = d.get("unit", "%")
-        ref  = d.get("ref","—")
+def _fmt_delta(d):
+    v, p, u = d.get("val"), d.get("prev"), d.get("unit","")
+    if v is None or p is None: return None
+    try:
+        diff = v - float(p)
+        if u == "%":               return f"{diff:+.1f}pp vs período ant."
+        if u in ("B USD","B CLP"): return f"{diff:+.2f} vs período ant."
+        if u == "M USD":           return f"USD {diff:+,.0f}M vs período ant."
+        if u == "USD":             return f"USD {diff:+,.0f} vs período ant."
+        return f"{diff:+.2f} vs período ant."
+    except: return None
 
-        if unit == "%":
-            val_str  = _pct(val)
-            try:
-                diff     = val - float(prev)
-                prev_str = f"{diff:+.1f}pp vs período ant."
-            except: prev_str = None
-        else:
-            val_str  = f"USD {val:,.0f}M" if val is not None else "—"
-            try:
-                diff     = val - float(prev)
-                prev_str = f"USD {diff:+,.0f}M vs período ant."
-            except: prev_str = None
+def _render_metrics(group_data, ncols=4):
+    """Render metric cards for a PIB group."""
+    items = list(group_data.items())
+    if not items:
+        st.info("Sin datos disponibles en este momento.")
+        return
+    cols = st.columns(min(ncols, len(items)))
+    for i, (label, d) in enumerate(items):
+        col = cols[i % ncols]
+        col.metric(label, _fmt_val(d), delta=_fmt_delta(d))
+        col.caption(f"📅 {d.get('ref','—')} · **BCCh**")
+        if (i + 1) % ncols == 0 and i + 1 < len(items):
+            cols = st.columns(min(ncols, len(items) - i - 1))
 
-        col.metric(key, val_str, delta=prev_str)
-        col.caption(f"📅 {ref} · **BCCh**")
+def _render_table(group_data):
+    """Render a comparison table for a PIB group."""
+    rows = []
+    for label, d in group_data.items():
+        rows.append({
+            "Indicador":        label,
+            "Valor Actual":     _fmt_val(d),
+            "Período Anterior": _fmt_val({**d, "val": d.get("prev")}),
+            "Variación":        _fmt_delta(d) or "—",
+            "Período":          d.get("ref","—"),
+            "Unidad":           d.get("unit","—"),
+        })
+    if rows:
+        df = pd.DataFrame(rows).set_index("Indicador")
+        st.dataframe(df, width="stretch")
 
-        if (i + 1) % 4 == 0 and i + 1 < len(rows):
-            cols_pib = st.columns(min(4, len(rows) - i - 1))
-else:
-    st.info("No se pudieron cargar los datos del sector real.")
+def _wb_chart(wb_hist, series_label, title, y_label=""):
+    """Render a World Bank historical line chart."""
+    series = wb_hist.get(series_label, {})
+    if not series: return
+    df_chart = pd.DataFrame({"Año": list(series.keys()), y_label or title: list(series.values())})
+    df_chart = df_chart.set_index("Año")
+    st.line_chart(df_chart, height=220)
+    st.caption(f"Fuente: World Bank Open Data · Chile · {series_label}")
+
+# ─── 5-tab PIB section ────────────────────────────────────────────
+tab_tasas, tab_vals, tab_comp, tab_sect, tab_ext = st.tabs([
+    "📈 Tasas de Crecimiento",
+    "💰 Valores Absolutos",
+    "🔗 Componentes (Demanda)",
+    "🏭 PIB por Sector",
+    "🌐 Externo y Fiscal",
+])
+
+with tab_tasas:
+    st.markdown("##### Tasas de crecimiento real — BCCh / INE")
+    _render_metrics(pib.get("tasas", {}))
+
+    st.markdown("---")
+    st.markdown("**📊 Historial anual — Crecimiento del PIB (%, 2010–2024)**")
+    _wb_chart(wb_hist, "Crecimiento PIB (%)", "Crecimiento PIB", "% anual")
+
+    with st.expander("📋 Tabla comparativa — tasas actuales", expanded=False):
+        _render_table(pib.get("tasas", {}))
+
+with tab_vals:
+    st.markdown("##### Tamaño del PIB y PIB per cápita — BCCh / World Bank")
+    _render_metrics(pib.get("valores", {}))
+
+    if usd_clp_rate:
+        pib_nom = pib.get("valores",{}).get("PIB Nominal",{}).get("val")
+        percap  = pib.get("valores",{}).get("PIB per cápita",{}).get("val")
+        if pib_nom and percap:
+            st.info(
+                f"**Equivalencia en pesos chilenos** (USD/CLP = ${usd_clp_rate:,.2f}):  \n"
+                f"- PIB Nominal: **CLP {pib_nom * usd_clp_rate / 1_000:,.1f}B**  \n"
+                f"- PIB per cápita: **CLP {percap * usd_clp_rate:,.0f}** por persona"
+            )
+
+    st.markdown("---")
+    col_h1, col_h2 = st.columns(2)
+    with col_h1:
+        st.markdown("**📊 PIB Nominal (B USD) — 2010–2024**")
+        _wb_chart(wb_hist, "PIB Nominal (B USD)", "PIB Nominal", "B USD")
+    with col_h2:
+        st.markdown("**📊 PIB per cápita (USD) — 2010–2024**")
+        _wb_chart(wb_hist, "PIB per cápita (USD)", "PIB per cápita", "USD")
+
+    col_h3, col_h4 = st.columns(2)
+    with col_h3:
+        st.markdown("**📊 PIB per cápita PPP (USD) — 2010–2024**")
+        _wb_chart(wb_hist, "PIB per cápita PPP (USD)", "PPP per cápita", "USD")
+    with col_h4:
+        pass
+
+    with st.expander("📋 Tabla histórica anual — valores absolutos", expanded=False):
+        hist_labels = ["PIB Nominal (B USD)", "PIB per cápita (USD)", "PIB per cápita PPP (USD)"]
+        rows_h = {}
+        for lbl in hist_labels:
+            for yr, v in wb_hist.get(lbl, {}).items():
+                rows_h.setdefault(yr, {})[lbl] = v
+        if rows_h:
+            df_h = pd.DataFrame(rows_h).T.sort_index(ascending=False)
+            st.dataframe(df_h, width="stretch")
+
+    with st.expander("📋 Tabla comparativa — valores actuales", expanded=False):
+        _render_table(pib.get("valores", {}))
+
+with tab_comp:
+    st.markdown("##### Componentes de la demanda agregada — BCCh")
+    _render_metrics(pib.get("componentes", {}))
+
+    exp = pib.get("componentes",{}).get("Exportaciones",{}).get("val")
+    imp = pib.get("componentes",{}).get("Importaciones",{}).get("val")
+    if exp and imp:
+        bal   = exp - imp
+        c_b1, c_b2, c_b3, _ = st.columns([1,1,1,1])
+        c_b1.metric("Exportaciones", f"USD {exp:,.0f}M")
+        c_b2.metric("Importaciones", f"USD {imp:,.0f}M")
+        c_b3.metric("Balanza neta", f"USD {bal:,.0f}M",
+                    delta="🟢 superávit" if bal >= 0 else "🔴 déficit")
+
+    st.markdown("---")
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        st.markdown("**📊 Consumo de hogares (% PIB) — histórico**")
+        _wb_chart(wb_hist, "Consumo Hogares (% PIB)", "Consumo Hogares", "% PIB")
+    with col_c2:
+        st.markdown("**📊 Formación bruta de capital fijo (% PIB) — histórico**")
+        _wb_chart(wb_hist, "FBCF (% PIB)", "FBCF", "% PIB")
+
+    col_c3, col_c4 = st.columns(2)
+    with col_c3:
+        st.markdown("**📊 Exportaciones (% PIB) — histórico**")
+        _wb_chart(wb_hist, "Exportaciones (% PIB)", "Exportaciones", "% PIB")
+    with col_c4:
+        st.markdown("**📊 Importaciones (% PIB) — histórico**")
+        _wb_chart(wb_hist, "Importaciones (% PIB)", "Importaciones", "% PIB")
+
+    with st.expander("📋 Tabla comparativa — componentes actuales", expanded=False):
+        _render_table(pib.get("componentes", {}))
+
+with tab_sect:
+    st.markdown("##### PIB por sector productivo — Banco Central de Chile")
+    st.caption("Valores en CLP Billones · Dec 2025 · Fuente: BCCh vía TradingEconomics")
+    sectores = pib.get("sectores", {})
+
+    if sectores:
+        _render_metrics(sectores, ncols=4)
+
+        st.markdown("---")
+        st.markdown("**📊 Aporte de cada sector al PIB (CLP Billones, período actual)**")
+
+        sect_vals = {k: d.get("val", 0) for k, d in sectores.items() if d.get("val")}
+        prev_vals = {k: d.get("prev", 0) for k, d in sectores.items() if d.get("prev")}
+
+        if sect_vals:
+            df_sect = pd.DataFrame({
+                "Actual (B CLP)":   pd.Series(sect_vals),
+                "Anterior (B CLP)": pd.Series(prev_vals),
+            }).sort_values("Actual (B CLP)", ascending=False)
+            st.bar_chart(df_sect, height=350)
+
+        with st.expander("📋 Tabla comparativa — sectores actuales vs anterior", expanded=True):
+            rows_s = []
+            for label, d in sectores.items():
+                v, p = d.get("val"), d.get("prev")
+                pct = f"{(v-p)/p*100:+.1f}%" if v and p and p != 0 else "—"
+                rows_s.append({
+                    "Sector":            label,
+                    "Actual (B CLP)":    f"{v:,.2f}" if v else "—",
+                    "Anterior (B CLP)":  f"{p:,.2f}" if p else "—",
+                    "Variación %":       pct,
+                    "Período":           d.get("ref","—"),
+                })
+            df_s = pd.DataFrame(rows_s).set_index("Sector")
+            st.dataframe(df_s, width="stretch")
+    else:
+        st.info("Sin datos de sector disponibles en este momento.")
+
+with tab_ext:
+    st.markdown("##### Sector externo, reservas y posición fiscal — BCCh")
+    _render_metrics(pib.get("externo", {}))
+
+    st.link_button("📊 Estadísticas BCCh — Sector Externo",
+        "https://www.bcentral.cl/web/banco-central/areas/estadisticas/sector-externo")
+
+    with st.expander("📋 Tabla comparativa — sector externo y fiscal", expanded=False):
+        _render_table(pib.get("externo", {}))
 
 st.divider()
 
@@ -640,9 +1008,10 @@ with cb:
         f"Vigente desde: {tpm.get('fecha','—')}  \n\n"
         f"**IPC Anual (mar 2026):** {_pct(ipc['yoy']) if ipc and 'yoy' in ipc else '—'}  \n"
         f"**IPC Mensual (mar 2026):** {_pct(ipc.get('mom')) if ipc else '—'}  \n"
-        f"**PIB YoY (Q4 2025):** {_pct(pib.get('PIB Anual',{}).get('val')) if pib else '—'}  \n"
-        f"**Exportaciones (feb):** USD {pib.get('Exportaciones',{}).get('val',0):,.0f}M  \n"
-        f"**Balanza Comercial (feb):** USD {pib.get('Balanza Comercial',{}).get('val',0):,.0f}M"
+        f"**PIB Anual:** {_fmt_val(pib.get('tasas',{}).get('PIB Anual',{}))}  \n"
+        f"**PIB per cápita:** {_fmt_val(pib.get('valores',{}).get('PIB per cápita',{}))}  \n"
+        f"**Exportaciones:** {_fmt_val(pib.get('componentes',{}).get('Exportaciones',{}))}  \n"
+        f"**Balanza Comercial:** {_fmt_val(pib.get('componentes',{}).get('Balanza Comercial',{}))}"
     )
     st.markdown("**🔗 Fuentes oficiales:**")
     st.link_button("📊 Estadísticas BCCh",
