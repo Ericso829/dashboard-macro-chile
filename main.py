@@ -13,6 +13,7 @@ from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 
 import feedparser
+import google.generativeai as genai
 import pandas as pd
 import requests
 import streamlit as st
@@ -98,6 +99,114 @@ INDICADOR_MAP: dict[str, list[str]] = {
 ECO_KEYWORDS: list[str] = [palabra for lista in INDICADOR_MAP.values() for palabra in lista]
 
 st.set_page_config(page_title="MIS Macroeconómico Chile", layout="wide")
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURACIÓN GEMINI AI
+# ═══════════════════════════════════════════════════════════════
+
+GEMINI_MODEL = "gemini-1.5-flash"   # modelo rápido y gratuito de Google
+
+GEMINI_SYSTEM_PROMPT = """Eres un analista económico experto en la economía chilena.
+Tu tarea es analizar noticias económicas recientes que afecten a Chile.
+Responde siempre en español, de forma clara y concisa para audiencias no especializadas."""
+
+
+def _configurar_gemini(api_key: str) -> bool:
+    """
+    Configura el cliente de Gemini con la API key proporcionada.
+    Retorna True si la configuración fue exitosa.
+    """
+    try:
+        genai.configure(api_key=api_key)
+        return True
+    except Exception as exc:
+        logger.warning("Error configurando Gemini: %s", exc)
+        return False
+
+
+def analizar_noticia_gemini(titulo: str, resumen: str, api_key: str) -> dict | None:
+    """
+    Analiza una noticia económica con Gemini y retorna:
+      - resumen_ia: resumen en 2-3 líneas en español simple
+      - impacto_ia: "Positivo", "Negativo" o "Neutral"
+      - explicacion: cómo afecta a indicadores como IPC, TPM o dólar
+
+    Retorna None si la API key no está configurada o hay un error.
+    """
+    if not api_key or not api_key.strip():
+        return None
+
+    try:
+        _configurar_gemini(api_key)
+        modelo = genai.GenerativeModel(GEMINI_MODEL)
+
+        prompt = f"""{GEMINI_SYSTEM_PROMPT}
+
+Analiza esta noticia económica de Chile:
+
+Título: {titulo}
+Contenido: {resumen[:600]}
+
+Responde EXACTAMENTE con este formato JSON (sin bloques de código, sin texto extra):
+{{
+  "resumen_ia": "Resumen en 2-3 líneas en español simple",
+  "impacto_ia": "Positivo|Negativo|Neutral",
+  "explicacion": "Cómo puede afectar a indicadores como IPC, TPM, dólar u otros"
+}}"""
+
+        respuesta = modelo.generate_content(prompt)
+        texto = respuesta.text.strip()
+
+        # Limpiar posibles bloques de código markdown
+        texto = texto.replace("```json", "").replace("```", "").strip()
+
+        import json
+        datos = json.loads(texto)
+
+        # Validar que el impacto sea uno de los valores permitidos
+        if datos.get("impacto_ia") not in ("Positivo", "Negativo", "Neutral"):
+            datos["impacto_ia"] = "Neutral"
+
+        return datos
+
+    except Exception as exc:
+        logger.warning("Error analizando noticia con Gemini: %s", exc)
+        return None
+
+
+def generar_insight_gemini(noticias: list[dict], api_key: str) -> str | None:
+    """
+    Genera un insight macroeconómico del período basado en las noticias recientes.
+    Retorna un string con el análisis o None si falla.
+    """
+    if not api_key or not api_key.strip() or not noticias:
+        return None
+
+    try:
+        _configurar_gemini(api_key)
+        modelo = genai.GenerativeModel(GEMINI_MODEL)
+
+        lista = "\n".join(
+            f"- [{n['impacto']}] {n['titulo']}"
+            for n in noticias[:10]
+        )
+
+        prompt = f"""{GEMINI_SYSTEM_PROMPT}
+
+Basándote en estas noticias recientes de Chile:
+{lista}
+
+Escribe un análisis macroeconómico breve del período actual (máximo 5 líneas).
+Menciona las principales tendencias, riesgos y qué indicadores están más afectados.
+Responde solo con el análisis, sin títulos ni listas."""
+
+        respuesta = modelo.generate_content(prompt)
+        return respuesta.text.strip()
+
+    except Exception as exc:
+        logger.warning("Error generando insight con Gemini: %s", exc)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1082,6 +1191,32 @@ def _grafico_wb(wb_hist: dict, etiqueta_serie: str, titulo: str, eje_y: str = ""
 # ═══════════════════════════════════════════════════════════════
 
 st.title("📊 Dashboard Macroeconómico Chile")
+
+# ─── Sidebar: configuración Gemini ───────────────────────────────
+with st.sidebar:
+    st.markdown("## 🤖 Inteligencia Artificial")
+    st.markdown(
+        "Ingresa tu API key de [Google Gemini](https://aistudio.google.com/app/apikey) "
+        "para obtener resúmenes automáticos y análisis de noticias."
+    )
+    gemini_api_key = st.text_input(
+        "Google Gemini API Key",
+        type="password",
+        placeholder="AIza...",
+        help="La clave no se guarda ni se comparte. Solo se usa en tu sesión actual.",
+        key="gemini_key",
+    )
+    if gemini_api_key:
+        st.success("✅ Clave configurada — IA activa")
+    else:
+        st.info("ℹ️ Sin clave: el dashboard funciona sin IA")
+
+    st.divider()
+    st.markdown("**Fuentes de datos**")
+    st.markdown(
+        "BCCh · INE · Mindicador.cl · "
+        "TradingEconomics · Yahoo Finance · World Bank"
+    )
 st.caption(
     f"Actualizado: {datetime.now(TZ_CL).strftime('%d/%m/%Y %H:%M')} (hora Chile)  ·  "
     "Publicaciones según última disponibilidad oficial"
@@ -1394,6 +1529,27 @@ with col_noticias:
 
     noticias = fetch_noticias()
 
+    # ── Insight macroeconómico con Gemini ─────────────────────
+    if gemini_api_key:
+        with st.expander("🤖 Insight macroeconómico IA — Gemini", expanded=True):
+            if st.button("✨ Generar análisis del período", key="btn_insight"):
+                with st.spinner("Analizando con Gemini…"):
+                    insight = generar_insight_gemini(noticias, gemini_api_key)
+                if insight:
+                    st.session_state["gemini_insight"] = insight
+                else:
+                    st.warning("No se pudo generar el análisis. Verifica tu API key.")
+
+            if "gemini_insight" in st.session_state:
+                st.markdown(
+                    f"""<div style="background:#f0f7ff;border-left:3px solid #3b82f6;
+                    padding:12px 16px;border-radius:0 8px 8px 0;font-size:14px;
+                    line-height:1.6;color:#1e3a5f;">
+                    {st.session_state['gemini_insight']}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
     col_f1, col_f2 = st.columns([2, 2])
     with col_f1:
         filtro_impacto = st.selectbox(
@@ -1419,9 +1575,55 @@ with col_noticias:
         for noticia in noticias_filtradas:
             indicadores_str = " · ".join(f"`{i}`" for i in noticia["indicadores"])
             fuentes_str     = " · ".join(noticia.get("fuentes", []))
+
             with st.expander(f"{noticia['impacto']}  {noticia['titulo']}"):
+                # Resumen original (scraping)
                 if noticia.get("resumen"):
                     st.write(noticia["resumen"])
+
+                # ── Botón de análisis Gemini por noticia ──────────
+                if gemini_api_key:
+                    cache_key = f"gemini_{hash(noticia['titulo'])}"
+                    btn_key   = f"btn_{hash(noticia['titulo'])}"
+
+                    if cache_key not in st.session_state:
+                        if st.button("🤖 Analizar con Gemini", key=btn_key):
+                            with st.spinner("Analizando…"):
+                                resultado = analizar_noticia_gemini(
+                                    noticia["titulo"],
+                                    noticia.get("resumen", ""),
+                                    gemini_api_key,
+                                )
+                            if resultado:
+                                st.session_state[cache_key] = resultado
+                            else:
+                                st.session_state[cache_key] = {"error": True}
+
+                    # Mostrar resultado si ya fue analizado
+                    if cache_key in st.session_state:
+                        analisis = st.session_state[cache_key]
+                        if analisis.get("error"):
+                            st.warning("No se pudo analizar esta noticia.")
+                        else:
+                            impacto_color = {
+                                "Positivo": "#dcfce7", "Negativo": "#fee2e2", "Neutral": "#fef9c3"
+                            }.get(analisis.get("impacto_ia", "Neutral"), "#f3f4f6")
+                            impacto_texto_color = {
+                                "Positivo": "#166534", "Negativo": "#991b1b", "Neutral": "#854d0e"
+                            }.get(analisis.get("impacto_ia", "Neutral"), "#374151")
+
+                            st.markdown(
+                                f"""<div style="background:{impacto_color};border-radius:8px;
+                                padding:12px 14px;margin:8px 0;font-size:13px;line-height:1.6;">
+                                <b style="color:{impacto_texto_color};">
+                                🤖 Análisis Gemini — Impacto {analisis.get('impacto_ia','')}
+                                </b><br><br>
+                                <b>Resumen:</b> {analisis.get('resumen_ia','')}<br><br>
+                                <b>Efecto en indicadores:</b> {analisis.get('explicacion','')}
+                                </div>""",
+                                unsafe_allow_html=True,
+                            )
+
                 st.markdown(f"**Indicadores afectados:** {indicadores_str}")
                 st.caption(f"Fuente: {fuentes_str}")
                 st.link_button("Leer nota completa →", noticia["link"])
